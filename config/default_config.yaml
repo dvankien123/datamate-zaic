@@ -1,0 +1,22 @@
+# Configuration for DataMate Baseline
+project_name: "datamate-zaic"
+
+paths:
+  train_dir: "data/train"
+  public_test_dir: "data/public_test"
+  submission_file: "submission.jsonl"
+  logs_dir: "logs"
+
+execution:
+  sandbox_timeout: 10 # seconds
+  max_repair_attempts: 2
+  default_abstain_on_error: true
+
+llm:
+  model_type: "qwen2.5-coder-7b"
+  quantization: "4bit"
+  max_context_tokens: 8192
+  temperature: 0.0
+
+entity_matching:
+  similarity_threshold: 75.0
