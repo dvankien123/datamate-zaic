@@ -1,0 +1,17 @@
+# Core Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+duckdb>=1.0.0
+
+# Fuzzy Matching & NLP Utilities
+rapidfuzz>=3.0.0
+
+# Configuration & Data Validation
+pyyaml>=6.0
+pydantic>=2.0.0
+
+# Testing & Utilities
+pytest>=7.0.0
+tqdm>=4.65.0
+python-dotenv>=1.0.0
