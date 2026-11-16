@@ -2,9 +2,19 @@
 import re
 import time
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import duckdb
 import pandas as pd
+
+
+_SQL_FENCE_RE = re.compile(
+    r"```(?:sql)?[ \t]*(?:\r?\n|[ \t]+)([\s\S]*?)```",
+    re.IGNORECASE,
+)
+_SQL_START_RE = re.compile(
+    r"^\s*(?:(?:--[^\r\n]*|/\*[\s\S]*?\*/)\s*)*(?:SELECT|WITH)\b",
+    re.IGNORECASE,
+)
 
 
 class ExecutionSandbox:
@@ -17,32 +27,16 @@ class ExecutionSandbox:
     def execute_sql(self, sql_query: str) -> Dict[str, Any]:
         """Execute a DuckDB SQL query and return rows/dataframe."""
         t0 = time.time()
-        raw = sql_query.strip()
-
-        # 1. Remove thinking tags if present (e.g. from DeepSeek R1 / QwQ)
-        raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
-
-        # 2. Extract code block
-        code_blocks = re.findall(r"```(?:sql)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        if code_blocks:
-            # Pick block containing SQL query keyword (SELECT or WITH)
-            chosen = code_blocks[0]
-            for b in code_blocks:
-                if re.search(r"\b(SELECT|WITH)\b", b, re.IGNORECASE):
-                    chosen = b
-                    break
-            clean_sql = chosen.strip()
-        else:
-            # Fallback: find starting from WITH or SELECT
-            m = re.search(r"\b(WITH|SELECT)\b[\s\S]*", raw, re.IGNORECASE)
-            if m:
-                clean_sql = m.group(0).strip()
-            else:
-                clean_sql = raw
-
-        # Clean trailing semicolon or backticks
-        clean_sql = re.sub(r";\s*$", "", clean_sql).strip()
-        clean_sql = clean_sql.rstrip("`").strip()
+        clean_sql, extraction_error = self._extract_sql(sql_query)
+        if extraction_error:
+            return {
+                "success": False,
+                "data": None,
+                "error": f"SQLExtractionError: {extraction_error}",
+                "traceback": None,
+                "elapsed_time": time.time() - t0,
+                "query": clean_sql,
+            }
 
         try:
             rel = self.con.execute(clean_sql)
@@ -65,6 +59,34 @@ class ExecutionSandbox:
                 "elapsed_time": elapsed,
                 "query": clean_sql
             }
+
+    @staticmethod
+    def _extract_sql(sql_response: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract exactly one SELECT/WITH query from an LLM response."""
+        raw = str(sql_response or "").strip()
+        if not raw:
+            return None, "LLM response is empty."
+
+        # Remove complete reasoning blocks before looking for a query.
+        raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+
+        if "```" in raw:
+            blocks = [block.strip() for block in _SQL_FENCE_RE.findall(raw)]
+            candidates = [block for block in blocks if _SQL_START_RE.match(block)]
+            if len(candidates) != 1:
+                if not candidates:
+                    return None, "No fenced SELECT/WITH query found."
+                return None, "Multiple fenced SELECT/WITH queries found; expected one."
+            clean_sql = candidates[0]
+        else:
+            clean_sql = raw
+            if not _SQL_START_RE.match(clean_sql):
+                return None, "Response must contain one SELECT/WITH query."
+
+        clean_sql = re.sub(r";\s*$", "", clean_sql).strip().rstrip("`").strip()
+        if not clean_sql:
+            return None, "Extracted SQL is empty."
+        return clean_sql, None
 
     def execute_python(self, py_code: str) -> Dict[str, Any]:
         """
