@@ -2,7 +2,7 @@
 import json
 import urllib.request
 import urllib.error
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 
 class LocalLLMClient:
@@ -12,11 +12,17 @@ class LocalLLMClient:
         self,
         base_url: str = "http://localhost:8000/v1",
         model_name: str = "qwen2.5-coder-7b",
-        timeout: int = 30
+        timeout: int = 120,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+        verbose: bool = False
     ):
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.timeout = timeout
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.verbose = verbose
         self._online: Optional[bool] = None
 
     def is_available(self, force_check: bool = False) -> bool:
@@ -29,28 +35,46 @@ class LocalLLMClient:
                 f"{self.base_url}/models",
                 headers={"User-Agent": "DataMateAgent"}
             )
-            with urllib.request.urlopen(req, timeout=1.0) as response:
+            with urllib.request.urlopen(req, timeout=2.0) as response:
                 self._online = (response.status == 200)
-        except Exception:
+        except Exception as e:
+            if self.verbose:
+                print(f"[LLM Check Warning] Could not connect to {self.base_url}/models: {e}")
             self._online = False
             
         return self._online
 
-    def generate(self, prompt: str, temperature: float = 0.0, max_tokens: int = 1024) -> Optional[str]:
+    def generate(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[List[str]] = None
+    ) -> Optional[str]:
         """Send chat completion request to local LLM."""
         if not self.is_available():
+            if self.verbose:
+                print(f"[LLM Warning] Endpoint {self.base_url} is not online.")
             return None
 
         url = f"{self.base_url}/chat/completions"
-        payload = {
+        system_content = (
+            "You are an expert DuckDB SQL generator for Vietnamese business analytics. "
+            "Output ONLY standard DuckDB SQL inside a single ```sql ... ``` block. "
+            "Never provide any conversational text, explanations, or analysis outside the code block."
+        )
+        
+        payload: Dict[str, Any] = {
             "model": self.model_name,
             "messages": [
-                {"role": "system", "content": "You are an expert data analysis code generator."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens
+            "temperature": self.temperature if temperature is None else temperature,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens
         }
+        if stop:
+            payload["stop"] = stop
         
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -63,5 +87,14 @@ class LocalLLMClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 return res_json["choices"][0]["message"]["content"]
-        except Exception as e:
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            print(f"[LLM HTTP ERROR {e.code}] {e.reason}: {err_body}")
             return None
+        except urllib.error.URLError as e:
+            print(f"[LLM URL/TIMEOUT ERROR] {e.reason} (timeout={self.timeout}s)")
+            return None
+        except Exception as e:
+            print(f"[LLM ERROR {type(e).__name__}]: {e}")
+            return None
+
