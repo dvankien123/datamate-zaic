@@ -1,4 +1,5 @@
 """Deterministic execution sandbox for SQL and Python scripts with timeout and error capture."""
+import re
 import time
 import traceback
 from typing import Dict, Any, Optional
