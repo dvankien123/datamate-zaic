@@ -16,15 +16,32 @@ class ExecutionSandbox:
     def execute_sql(self, sql_query: str) -> Dict[str, Any]:
         """Execute a DuckDB SQL query and return rows/dataframe."""
         t0 = time.time()
-        # Clean query: strip markdown blocks if present
-        clean_sql = sql_query.strip()
-        if clean_sql.startswith("```sql"):
-            clean_sql = clean_sql[6:]
-        elif clean_sql.startswith("```"):
-            clean_sql = clean_sql[3:]
-        if clean_sql.endswith("```"):
-            clean_sql = clean_sql[:-3]
-        clean_sql = clean_sql.strip()
+        raw = sql_query.strip()
+
+        # 1. Remove thinking tags if present (e.g. from DeepSeek R1 / QwQ)
+        raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+
+        # 2. Extract code block
+        code_blocks = re.findall(r"```(?:sql)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+        if code_blocks:
+            # Pick block containing SQL query keyword (SELECT or WITH)
+            chosen = code_blocks[0]
+            for b in code_blocks:
+                if re.search(r"\b(SELECT|WITH)\b", b, re.IGNORECASE):
+                    chosen = b
+                    break
+            clean_sql = chosen.strip()
+        else:
+            # Fallback: find starting from WITH or SELECT
+            m = re.search(r"\b(WITH|SELECT)\b[\s\S]*", raw, re.IGNORECASE)
+            if m:
+                clean_sql = m.group(0).strip()
+            else:
+                clean_sql = raw
+
+        # Clean trailing semicolon or backticks
+        clean_sql = re.sub(r";\s*$", "", clean_sql).strip()
+        clean_sql = clean_sql.rstrip("`").strip()
 
         try:
             rel = self.con.execute(clean_sql)
