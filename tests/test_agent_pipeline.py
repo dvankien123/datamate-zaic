@@ -11,6 +11,14 @@ class StubLLM:
         return "```sql\nSELECT SUM(amount) AS total FROM sales\n```"
 
 
+class SequenceLLM:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+
+    def generate(self, prompt, **kwargs):
+        return next(self.responses)
+
+
 def test_agent_executes_llm_sql_instead_of_abstaining():
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE sales (amount INTEGER)")
@@ -37,6 +45,45 @@ def test_agent_executes_llm_sql_instead_of_abstaining():
         con.close()
 
     assert result == {"id": "q_sql_smoke", "type": "number", "answer": 42}
+    assert agent.last_execution_trace[0]["stage"] == "initial"
+    assert agent.last_execution_trace[0]["success"] is True
+
+
+def test_agent_repairs_parser_error_and_records_both_sql_attempts():
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE sales (amount INTEGER)")
+    con.execute("INSERT INTO sales VALUES (20), (22)")
+    indexer = SchemaIndexer(
+        con,
+        {"sales": {"row_count": 2, "source_file": "sales.csv"}},
+    )
+    llm = SequenceLLM([
+        "```sql\nSELECT FROM sales\n```",
+        "```sql\nSELECT SUM(amount) AS total FROM sales\n```",
+    ])
+    agent = DataMateAgent(data_dir=".", llm_client=llm, max_repair_attempts=1)
+    loader = SimpleNamespace(get_connection=lambda: con)
+    agent.get_business_context = lambda business_id: (loader, indexer)
+
+    try:
+        result = agent.answer_question(
+            {
+                "id": "q_sql_repair",
+                "business_id": "biz_test",
+                "question": "Doanh thu là bao nhiêu?",
+                "as_of_date": "2026-11-16",
+            }
+        )
+    finally:
+        con.close()
+
+    assert result == {"id": "q_sql_repair", "type": "number", "answer": 42}
+    assert len(agent.last_execution_trace) == 2
+    assert agent.last_execution_trace[0]["clean_sql"] == "SELECT FROM sales"
+    assert agent.last_execution_trace[0]["success"] is False
+    assert agent.last_execution_trace[0]["error"].startswith("ParserException:")
+    assert agent.last_execution_trace[1]["stage"] == "repair"
+    assert agent.last_execution_trace[1]["success"] is True
 
 
 def test_agent_unanswerable_pipeline():

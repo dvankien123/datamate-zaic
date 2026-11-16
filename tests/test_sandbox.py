@@ -11,6 +11,8 @@ from src.engine.sandbox import ExecutionSandbox
     [
         "SELECT 42 AS answer",
         "```sql\nSELECT 42 AS answer;\n```",
+        "<think>reasoning</think>\n```sql\nSELECT 42 AS answer;\n```",
+        "Query:\n```sql\nSELECT 42 AS answer;\n```",
     ],
 )
 def test_sandbox_executes_plain_and_fenced_sql(query):
@@ -33,6 +35,64 @@ def test_sandbox_returns_structured_error_for_invalid_sql():
         assert result["data"] is None
         assert result["error"]
         assert "NameError" not in result["error"]
+    finally:
+        con.close()
+
+
+def test_sandbox_rejects_non_sql_fence_with_clear_error():
+    con = duckdb.connect(":memory:")
+    try:
+        result = ExecutionSandbox(con).execute_sql("```python\nprint('not SQL')\n```")
+
+        assert result["success"] is False
+        assert result["query"] is None
+        assert result["error"].startswith("SQLExtractionError:")
+    finally:
+        con.close()
+
+
+def test_sandbox_rejects_multiple_sql_blocks_as_ambiguous():
+    con = duckdb.connect(":memory:")
+    try:
+        result = ExecutionSandbox(con).execute_sql(
+            "```sql\nSELECT 1\n```\n```sql\nSELECT 2\n```"
+        )
+
+        assert result["success"] is False
+        assert result["error"].startswith("SQLExtractionError:")
+        assert "Multiple" in result["error"]
+    finally:
+        con.close()
+
+
+def test_schema_indexer_uses_normalized_date_range():
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute('CREATE TABLE sales ("ngày" VARCHAR, "ngày_normalized" DATE)')
+        con.execute("INSERT INTO sales VALUES ('01/11/2025', DATE '2025-11-01'), ('02/11/2025', DATE '2025-11-02')")
+        indexer = SchemaIndexer(
+            con,
+            {
+                "sales": {
+                    "row_count": 2,
+                    "source_file": "sales.xlsx",
+                    "normalizations": {
+                        "ngày": {
+                            "normalized_column": "ngày_normalized",
+                            "kind": "date",
+                            "parse_failures": 0,
+                        }
+                    },
+                }
+            },
+        )
+
+        assert indexer.profile["sales"]["date_range"] == {
+            "col": "ngày_normalized",
+            "min": "2025-11-01",
+            "max": "2025-11-02",
+        }
+        assert "đã chuẩn hóa từ `ngày`" in indexer.to_prompt_context()
     finally:
         con.close()
 
