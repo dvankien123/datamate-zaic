@@ -94,24 +94,27 @@ class PromptBuilder:
         type_hint = detect_type_hint(question)
         time_context = extract_time_context(question, as_of_date, self.cal_helper)
 
-        prompt = f"""Bạn là một trợ lý phân tích dữ liệu chuyên nghiệp cho doanh nghiệp Việt Nam.
-Nhiệm vụ của bạn là viết MỘT câu truy vấn DuckDB SQL DUY NHẤT để trả lời câu hỏi của người dùng.
+        prompt = f"""Bạn là trợ lý phân tích dữ liệu DuckDB SQL chuyên nghiệp cho doanh nghiệp Việt Nam.
+Hãy viết MỘT câu truy vấn DuckDB SQL DUY NHẤT để trả lời câu hỏi dưới đây.
 
-### QUY TẮC NGHIỆP VỤ BẮT BUỘC (RULEBOOK):
+### QUY TẮC NGHIỆP VỤ BẮT BUỘC:
 1. **Doanh thu**: Tổng thành tiền sau chiết khấu dòng (không trừ voucher đơn, không cộng VAT/phí ship). BỎ các đơn có trạng thái Huỷ hoặc Trả hàng (kể cả trả 1 phần).
 2. **Bán chạy / Hot nhất**: Xếp hạng theo SỐ LƯỢNG (quy về đơn vị cơ bản), BỎ đơn huỷ, trả.
 3. **Mốc thời gian**: Dữ liệu phát sinh sau ngày mốc as_of_date coi như chưa xảy ra (loại bỏ).
-4. **Kiểu đáp án dự kiến**: `{type_hint}`.
+4. **Cú pháp DuckDB SQL**:
+   - Tên bảng và tên cột có dấu hoặc số hoặc khoảng trắng: luôn bọc trong dấu ngoặc kép `"tên_cột"`.
+   - Tìm kiếm chuỗi tiếng Việt: dùng `ILIKE '%...%'`.
+   - Tránh chia cho 0: dùng `NULLIF(..., 0)`. Tránh NULL: dùng `COALESCE(..., 0)`.
+5. **Kiểu đáp án dự kiến**: `{type_hint}`.
 {time_context}
 
 {schema_context}
 
-### CÂU HỎI CỦA NGƯỜI DÙNG:
+### CÂU HỎI:
 "{question}"
 
-### YÊU CẦU ĐẦU RA:
-- Trả về câu lệnh DuckDB SQL chuẩn đặt trong khối ```sql ... ```.
-- Câu lệnh chỉ SELECT các cột cần thiết cho câu trả lời.
-- KHÔNG thêm bất kỳ giải thích nào bên ngoài khối ```sql ... ```.
+### QUY TẮC ĐẦU RA BẮT BUỘC:
+- CHỈ trả về DUY NHẤT một khối ```sql ... ```.
+- TUYỆT ĐỐI KHÔNG viết bất kỳ lời giải thích, chào hỏi, suy nghĩ hay ghi chú nào bên ngoài khối ```sql ... ```.
 """
         return prompt
