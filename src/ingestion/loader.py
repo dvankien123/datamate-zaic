@@ -1,9 +1,13 @@
 """Loader to ingest heterogeneous business files (.csv, .xlsx, .sqlite) into DuckDB."""
 import re
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import duckdb
 import pandas as pd
+from src.ingestion.value_normalizer import (
+    drop_repeated_header_rows,
+    normalize_dataframe_for_duckdb,
+)
 
 
 def clean_table_name(name: str) -> str:
@@ -88,26 +92,91 @@ class BusinessDataLoader:
             self.con.execute(
                 f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM read_csv_auto('{file_path.as_posix()}', normalize_names=True)"
             )
-            count = self.con.execute(f"SELECT COUNT(*) FROM \"{tbl_name}\"").fetchone()[0]
-            self.tables[tbl_name] = {
-                "source_file": file_path.name,
-                "type": "csv",
-                "row_count": count
-            }
         except Exception:
             try:
                 df = pd.read_csv(file_path, low_memory=False)
                 df.columns = [clean_table_name(c) for c in df.columns]
-                self.con.register("temp_df", df)
-                self.con.execute(f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM temp_df")
-                self.con.unregister("temp_df")
+                normalizations, dropped_headers = self._create_table_from_dataframe(tbl_name, df)
                 self.tables[tbl_name] = {
                     "source_file": file_path.name,
                     "type": "csv",
-                    "row_count": len(df)
+                    "row_count": len(df) - dropped_headers,
+                    "normalizations": normalizations,
+                    "dropped_repeated_header_rows": dropped_headers,
                 }
             except Exception as e:
                 print(f"Failed to load CSV {file_path.name}: {e}")
+            return
+
+        try:
+            normalizations, dropped_headers = self._normalize_existing_table(tbl_name)
+        except Exception as e:
+            # Keep the successfully loaded raw table if normalization cannot be applied.
+            print(f"Failed to normalize CSV {file_path.name}: {e}")
+            normalizations = {}
+            dropped_headers = 0
+        count = self.con.execute(f"SELECT COUNT(*) FROM \"{tbl_name}\"").fetchone()[0]
+        self.tables[tbl_name] = {
+            "source_file": file_path.name,
+            "type": "csv",
+            "row_count": count,
+            "normalizations": normalizations,
+            "dropped_repeated_header_rows": dropped_headers,
+        }
+
+    def _create_table_from_dataframe(
+        self, tbl_name: str, df: pd.DataFrame
+    ) -> Tuple[Dict[str, Dict[str, Any]], int]:
+        df, dropped_headers = drop_repeated_header_rows(df)
+        normalized_df, report = normalize_dataframe_for_duckdb(df)
+        self._register_dataframe(tbl_name, normalized_df, replace=False, report=report)
+        return report, dropped_headers
+
+    def _register_dataframe(
+        self,
+        tbl_name: str,
+        df: pd.DataFrame,
+        replace: bool,
+        report: Dict[str, Dict[str, Any]],
+    ) -> None:
+        temp_name = "_datamate_normalized_df"
+        self.con.register(temp_name, df)
+        create_clause = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE"
+        try:
+            self.con.execute(f'{create_clause} "{tbl_name}" AS SELECT * FROM {temp_name}')
+        except Exception:
+            # Preserve original fields as text if mixed source types prevent registration;
+            # typed companion columns remain typed.
+            normalized_columns = {
+                detail["normalized_column"]
+                for detail in report.values()
+                if detail.get("normalized_column")
+            }
+            fallback_df = df.copy()
+            for column in fallback_df.columns:
+                if column in normalized_columns:
+                    continue
+                fallback_df[column] = fallback_df[column].map(
+                    lambda value: None if pd.isna(value) else str(value)
+                )
+            self.con.unregister(temp_name)
+            self.con.register(temp_name, fallback_df)
+            self.con.execute(f'{create_clause} "{tbl_name}" AS SELECT * FROM {temp_name}')
+        finally:
+            try:
+                self.con.unregister(temp_name)
+            except Exception:
+                pass
+
+    def _normalize_existing_table(
+        self, tbl_name: str
+    ) -> Tuple[Dict[str, Dict[str, Any]], int]:
+        df = self.con.execute(f'SELECT * FROM "{tbl_name}"').df()
+        df, dropped_headers = drop_repeated_header_rows(df)
+        normalized_df, report = normalize_dataframe_for_duckdb(df)
+        if dropped_headers or any(item.get("normalized_column") for item in report.values()):
+            self._register_dataframe(tbl_name, normalized_df, replace=True, report=report)
+        return report, dropped_headers
 
     def _load_excel(self, file_path: Path, stem: str):
         try:
@@ -133,6 +202,8 @@ class BusinessDataLoader:
                     seen.add(c_clean)
                     clean_cols.append(c_clean)
                 df.columns = clean_cols
+                df, dropped_headers = drop_repeated_header_rows(df)
+                normalized_df, normalization_report = normalize_dataframe_for_duckdb(df)
                 
                 # Table name
                 if len(excel_file.sheet_names) == 1:
@@ -141,23 +212,15 @@ class BusinessDataLoader:
                     tbl_name = clean_table_name(f"{stem}_{sheet_name}")
                 
                 # Safely register into DuckDB
-                try:
-                    self.con.register("temp_sheet", df)
-                    self.con.execute(f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM temp_sheet")
-                    self.con.unregister("temp_sheet")
-                except Exception:
-                    # If mixed data types cause DuckDB register error, cast columns to string/object
-                    for col in df.columns:
-                        df[col] = df[col].astype(str).replace({"nan": None, "None": None})
-                    self.con.register("temp_sheet", df)
-                    self.con.execute(f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM temp_sheet")
-                    self.con.unregister("temp_sheet")
+                self._register_dataframe(tbl_name, normalized_df, replace=False, report=normalization_report)
                 
                 self.tables[tbl_name] = {
                     "source_file": file_path.name,
                     "sheet_name": sheet_name,
                     "type": "xlsx",
-                    "row_count": len(df)
+                    "row_count": len(df),
+                    "normalizations": normalization_report,
+                    "dropped_repeated_header_rows": dropped_headers,
                 }
         except Exception as e:
             print(f"Failed to load Excel {file_path.name}: {e}")
@@ -174,13 +237,13 @@ class BusinessDataLoader:
                 df = pd.read_sql_query(f"SELECT * FROM \"{t}\"", sqlite_con)
                 df.columns = [clean_table_name(c) for c in df.columns]
                 tbl_name = clean_table_name(t)
-                self.con.register("temp_sqlite", df)
-                self.con.execute(f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM temp_sqlite")
-                self.con.unregister("temp_sqlite")
+                normalizations, dropped_headers = self._create_table_from_dataframe(tbl_name, df)
                 self.tables[tbl_name] = {
                     "source_file": file_path.name,
                     "type": "sqlite",
-                    "row_count": len(df)
+                    "row_count": len(df) - dropped_headers,
+                    "normalizations": normalizations,
+                    "dropped_repeated_header_rows": dropped_headers,
                 }
             sqlite_con.close()
         except Exception as e:
