@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from src.agent.generator import DataMateAgent
 from src.llm.client import LocalLLMClient
+from src.llm.prompt_builder import detect_type_hint
 from src.evaluation.metric import calculate_penalized_accuracy
 
 
@@ -107,6 +108,9 @@ def main():
         t0 = time.time()
         pred = agent.answer_question(q)
         elapsed = time.time() - t0
+        sql_attempts = agent.last_execution_trace
+        attempted_sql = [item for item in sql_attempts if item.get("stage") in {"initial", "repair"}]
+        final_sql_attempt = attempted_sql[-1] if attempted_sql else None
         
         predictions.append(pred)
         logs.append({
@@ -114,7 +118,18 @@ def main():
             "business_id": q["business_id"],
             "question": q["question"],
             "as_of_date": q["as_of_date"],
-            "answer": pred,
+            "type_hint": detect_type_hint(q["question"]),
+            "sql": final_sql_attempt.get("clean_sql") if final_sql_attempt else None,
+            "sql_success": final_sql_attempt.get("success") if final_sql_attempt else None,
+            "sql_error": final_sql_attempt.get("error") if final_sql_attempt else None,
+            "repair_attempts": sum(item.get("stage") == "repair" for item in sql_attempts),
+            "data_diagnostics": agent.last_data_diagnostics,
+            "agent_error": next(
+                (item.get("error") for item in reversed(sql_attempts) if item.get("stage") == "agent"),
+                None,
+            ),
+            "sql_attempts": sql_attempts,
+             "answer": pred,
             "elapsed_seconds": round(elapsed, 3)
         })
         
