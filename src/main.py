@@ -43,6 +43,13 @@ def main():
     parser.add_argument("--llm-url", type=str, default="http://localhost:8000/v1", help="Base URL of local LLM")
     parser.add_argument("--model-name", type=str, default="qwen2.5-coder-7b", help="LLM model name")
     
+    # Hardware & Performance Tuning options (ideal for T4 vs Judge's GPUs)
+    parser.add_argument("--llm-timeout", type=int, default=120, help="LLM HTTP timeout in seconds (default: 120s for T4)")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Max generation tokens (default: 512)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="LLM sampling temperature (default: 0.0)")
+    parser.add_argument("--max-repair", type=int, default=1, help="Max self-repair attempts on SQL execution error (default: 1)")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed runtime steps and errors for each question")
+    
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -58,16 +65,36 @@ def main():
     if args.sample_size:
         questions = questions[:args.sample_size]
         
-    print(f"Loaded {len(questions)} questions from {questions_file}")
+    print("=" * 60)
+    print("DATAMATE PIPELINE INITIALIZATION")
+    print("=" * 60)
+    print(f"Questions:     {len(questions)} from {questions_file}")
+    print(f"Mode:          {args.mode}")
+    print(f"LLM Endpoint:  {args.llm_url}")
+    print(f"Model Name:    {args.model_name}")
+    print(f"Timeout:       {args.llm_timeout}s")
+    print(f"Max Tokens:    {args.max_tokens}")
+    print(f"Max Repair:    {args.max_repair}")
+    print(f"Verbose:       {args.verbose}")
     
-    llm_client = LocalLLMClient(base_url=args.llm_url, model_name=args.model_name)
+    llm_client = LocalLLMClient(
+        base_url=args.llm_url,
+        model_name=args.model_name,
+        timeout=args.llm_timeout,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        verbose=args.verbose
+    )
     is_llm_ready = llm_client.is_available()
-    print(f"Local LLM Server ({args.llm_url}): {'ONLINE' if is_llm_ready else 'OFFLINE (fallback mode)'}")
+    print(f"Local LLM Server: {'ONLINE' if is_llm_ready else 'OFFLINE (fallback mode)'}")
+    print("=" * 60)
     
     agent = DataMateAgent(
         data_dir=str(data_dir),
         calendar_path=str(calendar_file) if calendar_file.exists() else None,
-        llm_client=llm_client
+        llm_client=llm_client,
+        max_repair_attempts=args.max_repair,
+        verbose=args.verbose
     )
     
     predictions = []
@@ -95,17 +122,16 @@ def main():
     total_time = time.time() - t_start
     print(f"Completed {len(predictions)} questions in {total_time:.2f}s (avg: {total_time/len(predictions):.2f}s/q)")
 
-    # Save predictions and logs, or evaluate if answers are available
-    if args.mode == "run":
-        # Save submission
-        save_jsonl(predictions, args.output)
-        print(f"Saved predictions to {args.output}")
-        
-        # Save logs
-        logs_file = Path("logs") / "inference_logs.jsonl"
-        save_jsonl(logs, str(logs_file))
-        print(f"Saved logs to {logs_file}")
-    elif args.mode == "eval" and answers_file.exists():
+    # Save submission
+    save_jsonl(predictions, args.output)
+    print(f"Saved predictions to {args.output}")
+    
+    # Save logs
+    logs_file = Path("logs") / "inference_logs.jsonl"
+    save_jsonl(logs, str(logs_file))
+    print(f"Saved logs to {logs_file}")
+
+    if args.mode == "eval" and answers_file.exists():
         references = load_jsonl(str(answers_file))
         if args.sample_size:
             references = references[:args.sample_size]
