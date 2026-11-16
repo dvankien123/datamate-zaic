@@ -1,8 +1,40 @@
 import pytest
+import duckdb
 from pathlib import Path
 from src.ingestion.loader import BusinessDataLoader
 from src.ingestion.schema_indexer import SchemaIndexer
 from src.engine.sandbox import ExecutionSandbox
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 42 AS answer",
+        "```sql\nSELECT 42 AS answer;\n```",
+    ],
+)
+def test_sandbox_executes_plain_and_fenced_sql(query):
+    con = duckdb.connect(":memory:")
+    try:
+        result = ExecutionSandbox(con).execute_sql(query)
+
+        assert result["success"] is True
+        assert result["data"].iloc[0]["answer"] == 42
+    finally:
+        con.close()
+
+
+def test_sandbox_returns_structured_error_for_invalid_sql():
+    con = duckdb.connect(":memory:")
+    try:
+        result = ExecutionSandbox(con).execute_sql("SELECT FROM")
+
+        assert result["success"] is False
+        assert result["data"] is None
+        assert result["error"]
+        assert "NameError" not in result["error"]
+    finally:
+        con.close()
 
 
 def test_loader_and_sandbox_biz101():
