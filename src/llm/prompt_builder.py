@@ -105,7 +105,8 @@ Hãy viết MỘT câu truy vấn DuckDB SQL DUY NHẤT để trả lời câu h
    - Tên bảng và tên cột có dấu hoặc số hoặc khoảng trắng: luôn bọc trong dấu ngoặc kép `"tên_cột"`.
    - Tìm kiếm chuỗi tiếng Việt: dùng `ILIKE '%...%'`.
    - Tránh chia cho 0: dùng `NULLIF(..., 0)`. Tránh NULL: dùng `COALESCE(..., 0)`.
-5. **Kiểu đáp án dự kiến**: `{type_hint}`.
+5. **Dữ liệu đã chuẩn hóa**: Khi cộng tiền, tính số lượng hoặc lọc ngày, ưu tiên cột có hậu tố `_normalized` nếu schema có cột đó. Cột số lượng đã chuẩn hóa vẫn theo đơn vị của dòng; nếu cần đơn vị cơ bản, dùng cột số lượng quy đổi hoặc bảng quy đổi trong schema/README, không coi `1 thùng` là `1` đơn vị cơ bản.
+6. **Kiểu đáp án dự kiến**: `{type_hint}`.
 {time_context}
 
 {schema_context}
