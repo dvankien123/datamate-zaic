@@ -69,6 +69,8 @@ class ExecutionSandbox:
 
         # Remove complete reasoning blocks before looking for a query.
         raw = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.IGNORECASE).strip()
+        if re.search(r"<think\b", raw, flags=re.IGNORECASE):
+            return None, "LLM response ended inside a <think> block; no complete SQL response."
 
         if "```" in raw:
             blocks = [block.strip() for block in _SQL_FENCE_RE.findall(raw)]

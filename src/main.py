@@ -46,7 +46,7 @@ def main():
     
     # Hardware & Performance Tuning options (ideal for T4 vs Judge's GPUs)
     parser.add_argument("--llm-timeout", type=int, default=120, help="LLM HTTP timeout in seconds (default: 120s for T4)")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Max generation tokens (default: 512)")
+    parser.add_argument("--max-tokens", type=int, default=768, help="Max generation tokens (default: 768)")
     parser.add_argument("--temperature", type=float, default=0.0, help="LLM sampling temperature (default: 0.0)")
     parser.add_argument("--max-repair", type=int, default=1, help="Max self-repair attempts on SQL execution error (default: 1)")
     parser.add_argument("--verbose", action="store_true", help="Print detailed runtime steps and errors for each question")

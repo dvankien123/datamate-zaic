@@ -1,7 +1,8 @@
 """Loader to ingest heterogeneous business files (.csv, .xlsx, .sqlite) into DuckDB."""
 import re
+from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import duckdb
 import pandas as pd
 from src.ingestion.value_normalizer import (
@@ -58,8 +59,23 @@ class BusinessDataLoader:
         self.biz_id = self.biz_dir.name
         self.con = duckdb.connect(":memory:")
         self.tables: Dict[str, Dict[str, Any]] = {}
+        self.load_errors: List[Dict[str, Any]] = []
         self.readme_content: str = ""
         self._load_all()
+
+    def _record_load_error(
+        self, file_path: Path, error: Exception, sheet_name: Optional[str] = None
+    ):
+        """Keep ingestion failures visible to the agent instead of only printing them."""
+        item = {
+            "source_file": file_path.name,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        if sheet_name is not None:
+            item["sheet_name"] = str(sheet_name)
+        self.load_errors.append(item)
+        location = f" sheet {sheet_name!r}" if sheet_name is not None else ""
+        print(f"Failed to load {file_path.name}{location}: {error}")
 
     def _load_all(self):
         # 1. Read README.md if present
@@ -105,14 +121,14 @@ class BusinessDataLoader:
                     "dropped_repeated_header_rows": dropped_headers,
                 }
             except Exception as e:
-                print(f"Failed to load CSV {file_path.name}: {e}")
+                self._record_load_error(file_path, e)
             return
 
         try:
             normalizations, dropped_headers = self._normalize_existing_table(tbl_name)
         except Exception as e:
             # Keep the successfully loaded raw table if normalization cannot be applied.
-            print(f"Failed to normalize CSV {file_path.name}: {e}")
+            self._record_load_error(file_path, e)
             normalizations = {}
             dropped_headers = 0
         count = self.con.execute(f"SELECT COUNT(*) FROM \"{tbl_name}\"").fetchone()[0]
@@ -140,28 +156,90 @@ class BusinessDataLoader:
         report: Dict[str, Dict[str, Any]],
     ) -> None:
         temp_name = "_datamate_normalized_df"
-        self.con.register(temp_name, df)
+        normalized_numeric_columns = {
+            detail["normalized_column"]
+            for detail in report.values()
+            if detail.get("normalized_column")
+            and detail.get("kind") in {"amount", "quantity"}
+        }
+
+        # DuckDB can infer an overly narrow DECIMAL from pandas Decimal objects
+        # (for example DECIMAL(7,0) from an early small value). Register these
+        # normalized fields as text, then cast them explicitly below.
+        staging_df = df.copy()
+        for column in normalized_numeric_columns:
+            if column not in staging_df.columns:
+                continue
+
+            def decimal_text(value):
+                if pd.isna(value):
+                    return None
+                if isinstance(value, Decimal):
+                    return format(value, "f")
+                return str(value)
+
+            staging_df[column] = staging_df[column].map(decimal_text)
+
+        self.con.register(temp_name, staging_df)
         create_clause = "CREATE OR REPLACE TABLE" if replace else "CREATE TABLE"
+
+        def select_clause():
+            expressions = []
+            for column in staging_df.columns:
+                quoted = '"' + str(column).replace('"', '""') + '"'
+                if column in normalized_numeric_columns:
+                    expressions.append(f"TRY_CAST({quoted} AS DECIMAL(38,9)) AS {quoted}")
+                else:
+                    expressions.append(quoted)
+            return ", ".join(expressions)
+
+        def ensure_numeric_values_fit():
+            for column in normalized_numeric_columns:
+                if column not in staging_df.columns:
+                    continue
+                quoted = '"' + str(column).replace('"', '""') + '"'
+                invalid_count = self.con.execute(
+                    f"SELECT COUNT(*) FROM {temp_name} "
+                    f"WHERE {quoted} IS NOT NULL AND TRY_CAST({quoted} AS DECIMAL(38,9)) IS NULL"
+                ).fetchone()[0]
+                if invalid_count:
+                    raise ValueError(
+                        f"{invalid_count} normalized values in {column!r} do not fit DECIMAL(38,9)"
+                    )
+
         try:
-            self.con.execute(f'{create_clause} "{tbl_name}" AS SELECT * FROM {temp_name}')
+            ensure_numeric_values_fit()
+            self.con.execute(
+                f'{create_clause} "{tbl_name}" AS SELECT {select_clause()} FROM {temp_name}'
+            )
         except Exception:
             # Preserve original fields as text if mixed source types prevent registration;
             # typed companion columns remain typed.
-            normalized_columns = {
-                detail["normalized_column"]
-                for detail in report.values()
-                if detail.get("normalized_column")
-            }
+            # Do not hide numeric range errors behind this fallback.
+            try:
+                ensure_numeric_values_fit()
+            except ValueError:
+                raise
             fallback_df = df.copy()
             for column in fallback_df.columns:
-                if column in normalized_columns:
+                if column in normalized_numeric_columns:
                     continue
                 fallback_df[column] = fallback_df[column].map(
                     lambda value: None if pd.isna(value) else str(value)
                 )
             self.con.unregister(temp_name)
+            for column in normalized_numeric_columns:
+                if column in fallback_df.columns:
+                    fallback_df[column] = fallback_df[column].map(
+                        lambda value: None if pd.isna(value) else (
+                            format(value, "f") if isinstance(value, Decimal) else str(value)
+                        )
+                    )
             self.con.register(temp_name, fallback_df)
-            self.con.execute(f'{create_clause} "{tbl_name}" AS SELECT * FROM {temp_name}')
+            ensure_numeric_values_fit()
+            self.con.execute(
+                f'{create_clause} "{tbl_name}" AS SELECT {select_clause()} FROM {temp_name}'
+            )
         finally:
             try:
                 self.con.unregister(temp_name)
@@ -181,7 +259,12 @@ class BusinessDataLoader:
     def _load_excel(self, file_path: Path, stem: str):
         try:
             excel_file = pd.ExcelFile(file_path)
-            for sheet_name in excel_file.sheet_names:
+        except Exception as e:
+            self._record_load_error(file_path, e)
+            return
+
+        for sheet_name in excel_file.sheet_names:
+            try:
                 raw_df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
                 if raw_df.empty:
                     continue
@@ -222,10 +305,11 @@ class BusinessDataLoader:
                     "normalizations": normalization_report,
                     "dropped_repeated_header_rows": dropped_headers,
                 }
-        except Exception as e:
-            print(f"Failed to load Excel {file_path.name}: {e}")
+            except Exception as e:
+                self._record_load_error(file_path, e, sheet_name)
 
     def _load_sqlite(self, file_path: Path, stem: str):
+        sqlite_con = None
         try:
             import sqlite3
             sqlite_con = sqlite3.connect(file_path)
@@ -245,9 +329,11 @@ class BusinessDataLoader:
                     "normalizations": normalizations,
                     "dropped_repeated_header_rows": dropped_headers,
                 }
-            sqlite_con.close()
         except Exception as e:
-            print(f"Failed to load SQLite {file_path.name}: {e}")
+            self._record_load_error(file_path, e)
+        finally:
+            if sqlite_con is not None:
+                sqlite_con.close()
 
     def get_connection(self) -> duckdb.DuckDBPyConnection:
         return self.con

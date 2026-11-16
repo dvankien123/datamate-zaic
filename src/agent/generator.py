@@ -1,6 +1,6 @@
 """Core DataMate Agent coordinator orchestrating ingestion, reasoning, sandbox execution and repair."""
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 from src.ingestion.loader import BusinessDataLoader
 from src.ingestion.schema_indexer import SchemaIndexer
@@ -42,6 +42,10 @@ class DataMateAgent:
         if response is None:
             return None
         preview = re.sub(r"<think>[\s\S]*?</think>", "", str(response), flags=re.IGNORECASE).strip()
+        # A token-limited response may contain an opening tag without its close.
+        # Never persist that private reasoning text in inference logs.
+        preview = re.sub(r"<think>[\s\S]*$", "[reasoning omitted]", preview, flags=re.IGNORECASE).strip()
+        preview = re.sub(r"</?think>", "", preview, flags=re.IGNORECASE).strip()
         if len(preview) > max_chars:
             return preview[:max_chars] + "…[truncated]"
         return preview
@@ -52,6 +56,7 @@ class DataMateAgent:
         response: Optional[str],
         exec_result: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
+        llm_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         result = exec_result or {}
         self.last_execution_trace.append({
@@ -61,10 +66,13 @@ class DataMateAgent:
             "clean_sql": result.get("query"),
             "success": bool(result.get("success", False)),
             "error": error or result.get("error"),
+            "llm_metadata": dict(llm_metadata or {}),
         })
 
     @staticmethod
-    def _summarize_data_diagnostics(indexer: SchemaIndexer) -> Dict[str, Any]:
+    def _summarize_data_diagnostics(
+        indexer: SchemaIndexer, load_errors: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
         normalized_column_count = 0
         parse_failures = 0
         dropped_header_rows = 0
@@ -94,6 +102,8 @@ class DataMateAgent:
             "parse_failures": parse_failures,
             "dropped_repeated_header_rows": dropped_header_rows,
             "tables_with_warnings": tables_with_warnings,
+            "ingestion_complete": not bool(load_errors),
+            "load_errors": list(load_errors or []),
         }
 
     def get_business_context(self, business_id: str):
@@ -121,9 +131,30 @@ class DataMateAgent:
         
         try:
             loader, indexer = self.get_business_context(bid)
-            self.last_data_diagnostics = self._summarize_data_diagnostics(indexer)
+            self.last_data_diagnostics = self._summarize_data_diagnostics(
+                indexer, loader.load_errors
+            )
             con = loader.get_connection()
             sandbox = ExecutionSandbox(con)
+
+            # Date coverage and SQL answers are not trustworthy when any source
+            # file failed to load. Surface the failure instead of misrouting the
+            # question as unanswerable based on a partial dataset.
+            if loader.load_errors:
+                error = (
+                    f"Data ingestion incomplete: {len(loader.load_errors)} source file/sheet load error(s)."
+                )
+                self.last_execution_trace.append({
+                    "attempt": 1,
+                    "stage": "ingestion",
+                    "response_preview": None,
+                    "clean_sql": None,
+                    "success": False,
+                    "error": error,
+                })
+                if self.verbose:
+                    print(f"[{qid}] {error} -> abstain")
+                return {"id": qid, "type": "abstain"}
             
             # 1. Unanswerable check
             router = QuestionRouter(indexer.profile)
@@ -139,9 +170,14 @@ class DataMateAgent:
             
             # 3. Call LLM
             sql_response = self.llm.generate(prompt)
+            llm_metadata = dict(getattr(self.llm, "last_response_metadata", {}) or {})
             
             if not sql_response:
-                self._record_sql_attempt("initial", sql_response, error="LLM returned an empty response or timed out.")
+                self._record_sql_attempt(
+                    "initial", sql_response,
+                    error="LLM returned an empty response or timed out.",
+                    llm_metadata=llm_metadata,
+                )
                 if self.verbose:
                     print(f"[{qid}] LLM returned empty or timed out -> abstain")
                 return {"id": qid, "type": "abstain"}
@@ -149,7 +185,7 @@ class DataMateAgent:
             # 4. Sandbox execution loop with self-repair
             exec_res = sandbox.execute_sql(sql_response)
             last_sql_response = sql_response
-            self._record_sql_attempt("initial", sql_response, exec_res)
+            self._record_sql_attempt("initial", sql_response, exec_res, llm_metadata=llm_metadata)
             if self.verbose:
                 print(f"[{qid}] SQL attempt 1 (initial): {exec_res.get('query') or '<no SQL extracted>'}")
                 if not exec_res["success"]:
@@ -172,20 +208,24 @@ Schema và kiểu dữ liệu hiện có:
 
 Hãy sửa lỗi dựa trên lỗi DuckDB và schema. Chỉ trả về đúng một câu SELECT hoặc WITH hợp lệ cho DuckDB, trong một khối ```sql ... ```. Không viết giải thích hay nội dung ngoài khối SQL.
 """
-                fixed_sql = self.llm.generate(repair_prompt, max_tokens=256)
+                fixed_sql = self.llm.generate(repair_prompt)
+                llm_metadata = dict(getattr(self.llm, "last_response_metadata", {}) or {})
                 if not fixed_sql:
                     self._record_sql_attempt(
                         "repair",
                         fixed_sql,
                         exec_res,
                         error=f"Repair attempt {attempts} returned an empty response or timed out.",
+                        llm_metadata=llm_metadata,
                     )
                     if self.verbose:
                         print(f"[{qid}] Repair attempt {attempts} timed out or failed.")
                     break
                 last_sql_response = fixed_sql
                 exec_res = sandbox.execute_sql(fixed_sql)
-                self._record_sql_attempt("repair", fixed_sql, exec_res)
+                self._record_sql_attempt(
+                    "repair", fixed_sql, exec_res, llm_metadata=llm_metadata
+                )
                 if self.verbose:
                     print(f"[{qid}] SQL attempt {attempts + 1} (repair): {exec_res.get('query') or '<no SQL extracted>'}")
                     if not exec_res["success"]:

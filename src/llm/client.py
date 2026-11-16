@@ -13,7 +13,7 @@ class LocalLLMClient:
         base_url: str = "http://localhost:8000/v1",
         model_name: str = "qwen2.5-coder-7b",
         timeout: int = 120,
-        max_tokens: int = 512,
+        max_tokens: int = 768,
         temperature: float = 0.0,
         verbose: bool = False
     ):
@@ -24,6 +24,7 @@ class LocalLLMClient:
         self.temperature = temperature
         self.verbose = verbose
         self._online: Optional[bool] = None
+        self.last_response_metadata: Dict[str, Any] = {}
 
     def is_available(self, force_check: bool = False) -> bool:
         """Check if the local LLM endpoint is active (cached)."""
@@ -52,6 +53,7 @@ class LocalLLMClient:
         stop: Optional[List[str]] = None
     ) -> Optional[str]:
         """Send chat completion request to local LLM."""
+        self.last_response_metadata = {}
         if not self.is_available():
             if self.verbose:
                 print(f"[LLM Warning] Endpoint {self.base_url} is not online.")
@@ -73,6 +75,10 @@ class LocalLLMClient:
             "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens
         }
+        # Qwen3 otherwise spends a small SQL-generation budget in its <think>
+        # channel. vLLM exposes a hard switch through this chat-template option.
+        if "qwen3" in self.model_name.lower():
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         if stop:
             payload["stop"] = stop
         
@@ -86,7 +92,15 @@ class LocalLLMClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
-                return res_json["choices"][0]["message"]["content"]
+                choice = res_json["choices"][0]
+                usage = res_json.get("usage") or {}
+                self.last_response_metadata = {
+                    "finish_reason": choice.get("finish_reason"),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                }
+                return choice["message"]["content"]
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
             print(f"[LLM HTTP ERROR {e.code}] {e.reason}: {err_body}")
