@@ -20,13 +20,15 @@ class DataMateAgent:
         data_dir: str,
         calendar_path: Optional[str] = None,
         llm_client: Optional[LocalLLMClient] = None,
-        max_repair_attempts: int = 2
+        max_repair_attempts: int = 1,
+        verbose: bool = False
     ):
         self.data_dir = Path(data_dir)
         self.cal_helper = CalendarHelper(calendar_path) if calendar_path else None
         self.llm = llm_client or LocalLLMClient()
         self.prompt_builder = PromptBuilder(self.cal_helper)
         self.max_repair = max_repair_attempts
+        self.verbose = verbose
         
         # Cache loaders and indexers per business_id
         self._cache_loaders: Dict[str, BusinessDataLoader] = {}
@@ -62,6 +64,8 @@ class DataMateAgent:
             router = QuestionRouter(indexer.profile)
             is_unans, reason = router.check_unanswerable(question, as_of_date)
             if is_unans:
+                if self.verbose:
+                    print(f"[{qid}] Detected UNANSWERABLE: {reason}")
                 return {"id": qid, "type": "unanswerable", "reason": reason}
             
             # 2. Build prompt
@@ -72,7 +76,8 @@ class DataMateAgent:
             sql_response = self.llm.generate(prompt)
             
             if not sql_response:
-                # LLM not running or returned empty -> fallback to abstain or heuristic
+                if self.verbose:
+                    print(f"[{qid}] LLM returned empty or timed out -> abstain")
                 return {"id": qid, "type": "abstain"}
             
             # 4. Sandbox execution loop with self-repair
@@ -81,29 +86,42 @@ class DataMateAgent:
             
             while not exec_res["success"] and attempts < self.max_repair:
                 attempts += 1
-                repair_prompt = f"""Câu truy vấn SQL trước đó gặp lỗi thực thi:
+                if self.verbose:
+                    print(f"[{qid}] SQL Execution error (attempt {attempts}/{self.max_repair}): {exec_res['error']}")
+                
+                # Compact repair prompt to save tokens and inference time on GPU
+                repair_prompt = f"""Câu truy vấn DuckDB SQL sau bị lỗi thực thi:
 Lỗi: {exec_res['error']}
-Truy vấn cũ:
+
+Câu SQL lỗi:
+```sql
 {exec_res['query']}
+```
 
-Lược đồ bảng:
-{schema_context}
-
-Hãy sửa lại câu lệnh DuckDB SQL để khắc phục lỗi trên. Chỉ trả về câu lệnh trong khối ```sql ... ```:
+Hãy sửa lại câu lệnh DuckDB SQL trên để khắc phục lỗi. CHỈ trả về khối ```sql ... ``` không kèm giải thích:
 """
-                fixed_sql = self.llm.generate(repair_prompt)
+                fixed_sql = self.llm.generate(repair_prompt, max_tokens=256)
                 if not fixed_sql:
+                    if self.verbose:
+                        print(f"[{qid}] Repair attempt {attempts} timed out or failed.")
                     break
                 exec_res = sandbox.execute_sql(fixed_sql)
             
             # 5. Post-process result
             if exec_res["success"] and exec_res["data"] is not None:
-                return infer_and_format_result(qid, exec_res["data"], expected_type_hint=type_hint)
+                res = infer_and_format_result(qid, exec_res["data"], expected_type_hint=type_hint)
+                if self.verbose:
+                    print(f"[{qid}] SUCCESS -> type: {res.get('type')}, answer: {res.get('answer')}")
+                return res
             else:
+                if self.verbose:
+                    print(f"[{qid}] SQL failed after repairs ({exec_res.get('error')}) -> abstain")
                 # Failed execution after repair -> abstain to prevent -1 penalty
                 return {"id": qid, "type": "abstain"}
                 
         except Exception as e:
+            if self.verbose:
+                print(f"[{qid}] Unhandled Exception: {e}")
             # Any unhandled exception -> fallback to abstain
             return {"id": qid, "type": "abstain"}
 
