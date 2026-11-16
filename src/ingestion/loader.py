@@ -96,7 +96,7 @@ class BusinessDataLoader:
             }
         except Exception:
             try:
-                df = pd.read_csv(file_path)
+                df = pd.read_csv(file_path, low_memory=False)
                 df.columns = [clean_table_name(c) for c in df.columns]
                 self.con.register("temp_df", df)
                 self.con.execute(f"CREATE TABLE \"{tbl_name}\" AS SELECT * FROM temp_df")
